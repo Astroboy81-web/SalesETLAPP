@@ -1,0 +1,210 @@
+using CsvHelper;
+using CsvHelper.Configuration;
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.SqlClient;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace ETLVentasApp
+{
+    // Modelos (clases de datos) para los archivos CSV
+    public class Customer
+    {
+        public int CustomerID { get; set; }
+        public string FirstName { get; set; }
+        public string LastName { get; set; }
+        public string Email { get; set; }
+        public string Phone { get; set; }
+        public string City { get; set; }
+        public string Country { get; set; }
+    }
+
+    public class Product
+    {
+        public int ProductID { get; set; }
+        public string ProductName { get; set; }
+        public string Category { get; set; }
+        public decimal Price { get; set; }
+        public int Stock { get; set; }
+    }
+
+    public class Order
+    {
+        public int OrderID { get; set; }
+        public int CustomerID { get; set; }
+        public DateTime? OrderDate { get; set; }
+        public string Status { get; set; }
+    }
+
+    public class OrderDetail
+    {
+        public int OrderID { get; set; }
+        public int ProductID { get; set; }
+        public int Quantity { get; set; }
+        public decimal TotalPrice { get; set; }
+    }
+
+    public sealed class OrderMap : ClassMap<Order>
+    {
+        public OrderMap()
+        {
+            AutoMap(CultureInfo.InvariantCulture);
+            Map(m => m.OrderDate).TypeConverterOption.Format("yyyy-MM-dd");
+        }
+    }
+
+    public class ETLPipeline
+    {
+        private const string ConnectionString = "Server=DESKTOP-06V94UD;Database=AnalisisVentas;Integrated Security=SSPI;";
+
+        public bool RunETL()
+        {
+            try
+            {
+                // 1. Extracción (Extract)
+                var customers = ExtractData<Customer>("customers.csv");
+                var products = ExtractData<Product>("products.csv");
+                var orders = ExtractData<Order, OrderMap>("orders.csv");
+                var orderDetails = ExtractData<OrderDetail>("order_details.csv");
+
+                // 2. Transformación (Transform)
+                var transformedCustomers = TransformCustomers(customers);
+                var transformedProducts = TransformProducts(products);
+                var transformedOrders = orders;
+                var transformedOrderDetails = TransformOrderDetails(orderDetails);
+
+                // 3. Carga (Load)
+                LoadDataWithBulkCopy(transformedCustomers, "Clientes");
+                LoadDataWithBulkCopy(transformedProducts, "Productos");
+                LoadDataWithBulkCopy(transformedOrders, "Ventas");
+                LoadDataWithBulkCopy(transformedOrderDetails, "DetalleVentas");
+
+                System.Windows.Forms.MessageBox.Show("Proceso ETL completado con éxito.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                System.Windows.Forms.MessageBox.Show($"Error en el proceso ETL: {ex.Message}");
+                return false;
+            }
+        }
+
+        private List<T> ExtractData<T, TMap>(string filePath) where TMap : ClassMap
+        {
+            using (var reader = new StreamReader(filePath))
+            using (var csv = new CsvReader(reader, CultureInfo.InvariantCulture))
+            {
+                csv.Context.RegisterClassMap<TMap>();
+                return csv.GetRecords<T>().ToList();
+            }
+        }
+
+        private List<T> ExtractData<T>(string filePath)
+        {
+            using (var reader = new StreamReader(filePath))
+            using (var csv = new CsvReader(reader, CultureInfo.InvariantCulture))
+            {
+                return csv.GetRecords<T>().ToList();
+            }
+        }
+
+        // Método de transformación corregido para manejar duplicados por CustomerID y Email
+        private List<Customer> TransformCustomers(List<Customer> customers)
+        {
+            // Agrupar los clientes por CustomerID (para resolver duplicados de PK)
+            var distinctByID = customers.GroupBy(c => c.CustomerID).Select(g => g.First()).ToList();
+
+            // Usar un HashSet para filtrar duplicados por Email (para resolver duplicados de UNIQUE KEY)
+            var uniqueCustomers = new List<Customer>();
+            var seenEmails = new HashSet<string>();
+
+            foreach (var customer in distinctByID)
+            {
+                if (customer.Email != null && !seenEmails.Contains(customer.Email))
+                {
+                    uniqueCustomers.Add(customer);
+                    seenEmails.Add(customer.Email);
+                }
+            }
+
+            return uniqueCustomers;
+        }
+
+        private List<Product> TransformProducts(List<Product> products)
+        {
+            var uniqueProducts = new List<Product>();
+            var seenProductIDs = new HashSet<int>();
+
+            foreach (var product in products)
+            {
+                if (!seenProductIDs.Contains(product.ProductID) && product.Price >= 0)
+                {
+                    uniqueProducts.Add(product);
+                    seenProductIDs.Add(product.ProductID);
+                }
+            }
+            return uniqueProducts;
+        }
+
+        private List<OrderDetail> TransformOrderDetails(List<OrderDetail> details)
+        {
+            return details.Where(d => d.Quantity > 0).ToList();
+        }
+
+        private void LoadDataWithBulkCopy<T>(List<T> data, string tableName)
+        {
+            var dataTable = ConvertListToDataTable(data);
+
+            using (var connection = new SqlConnection(ConnectionString))
+            {
+                connection.Open();
+                using (var bulkCopy = new SqlBulkCopy(connection))
+                {
+                    bulkCopy.DestinationTableName = tableName;
+
+                    foreach (DataColumn col in dataTable.Columns)
+                    {
+                        bulkCopy.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                    }
+
+                    try
+                    {
+                        bulkCopy.WriteToServer(dataTable);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new Exception($"Error en la carga masiva en la tabla {tableName}: {ex.Message}", ex);
+                    }
+                }
+            }
+        }
+
+        private DataTable ConvertListToDataTable<T>(List<T> list)
+        {
+            var dataTable = new DataTable();
+            PropertyInfo[] properties = typeof(T).GetProperties();
+
+            foreach (PropertyInfo prop in properties)
+            {
+                dataTable.Columns.Add(prop.Name, Nullable.GetUnderlyingType(prop.PropertyType) ?? prop.PropertyType);
+            }
+
+            foreach (T item in list)
+            {
+                var row = dataTable.NewRow();
+                for (int i = 0; i < properties.Length; i++)
+                {
+                    row[i] = properties[i].GetValue(item) ?? DBNull.Value;
+                }
+                dataTable.Rows.Add(row);
+            }
+            return dataTable;
+        }
+    }
+}
